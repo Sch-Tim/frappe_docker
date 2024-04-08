@@ -1,5 +1,6 @@
-This fork resolves the issues mentioned [here](https://discuss.frappe.io/t/yet-another-wkhtmltopdf-thread/120309). 
-As a bonus, it's a multiarch build. You can use it with arm and x86.
+This fork resolves the issues mentioned [here](https://discuss.frappe.io/t/yet-another-wkhtmltopdf-thread/120309).   
+As a bonus, it's a multiarch build. You can use it with arm and x86.    
+The built image can be found here: https://hub.docker.com/repository/docker/timsch12345/erpnext-customized
 
 **If you just want to use the built image:** 
 1) Copy the compose.yml file and the example.env file. 
