@@ -1,26 +1,66 @@
-x-customizable-image: &customizable_image
-  # By default the image used only contains the `frappe` and `erpnext` apps.
-  # See https://github.com/frappe/frappe_docker/blob/main/docs/custom-apps.md
-  # about using custom images.
-  image: frappe/erpnext:${ERPNEXT_VERSION:?No ERPNext version set}
-
-x-depends-on-configurator: &depends_on_configurator
-  depends_on:
-    configurator:
-      condition: service_completed_successfully
-
-x-backend-defaults: &backend_defaults
-  <<: [*depends_on_configurator, *customizable_image]
-  volumes:
-    - sites:/home/frappe/frappe-bench/sites
+version: "3"
 
 services:
-  configurator:
-    <<: *backend_defaults
+  backend:
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+        required: true
+    image: ${IMAGE_NAME}:${IMAGE_TAG}
+    deploy:
+      restart_policy:
+        condition: on-failure
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - erpnext-network
+
+  create-site:
+    image: ${IMAGE_NAME}:${IMAGE_TAG}
+    deploy:
+      restart_policy:
+        condition: none
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+        required: true
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
     entrypoint:
       - bash
       - -c
-    # add redis_socketio for backward compatibility
+    command:
+      - >
+        wait-for-it -t 120 db:3306;
+        wait-for-it -t 120 redis-cache:6379;
+        wait-for-it -t 120 redis-queue:6379;
+        export start=`date +%s`;
+        until [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".db_host // empty"` ]] && \
+          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_cache // empty"` ]] && \
+          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_queue // empty"` ]];
+        do
+          echo "Waiting for sites/common_site_config.json to be created";
+          sleep 5;
+          if (( `date +%s`-start > 120 )); then
+            echo "could not find sites/common_site_config.json with required keys";
+            exit 1
+          fi
+        done;
+        echo "sites/common_site_config.json found";
+        bench new-site --no-mariadb-socket --admin-password=$ADMIN_PASSWORD --db-root-password=$DB_PASSWORD --install-app erpnext --install-app hrms --install-app payments --install-app erpnext_germany --set-default $SITE_NAME;
+    networks:
+      - erpnext-network
+
+  configurator:
+    image: ${IMAGE_NAME}:${IMAGE_TAG}
+    deploy:
+      restart_policy:
+        condition: none
+    entrypoint:
+      - bash
+      - -c
     command:
       - >
         ls -1 apps > sites/apps.txt;
@@ -28,58 +68,225 @@ services:
         bench set-config -gp db_port $$DB_PORT;
         bench set-config -g redis_cache "redis://$$REDIS_CACHE";
         bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
-        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
         bench set-config -gp socketio_port $$SOCKETIO_PORT;
-    environment:
-      DB_HOST: ${DB_HOST}
-      DB_PORT: ${DB_PORT}
-      REDIS_CACHE: ${REDIS_CACHE}
-      REDIS_QUEUE: ${REDIS_QUEUE}
-      SOCKETIO_PORT: 9000
-    depends_on: {}
+        bench set-config -gp background_workers $WORKER_COUNT;
+        bench set-config -g host_name "http://$TRAEFIK_DOMAIN";
+        bench --site frontend set-config host_name "http://$TRAEFIK_DOMAIN";
 
-  backend:
-    <<: *backend_defaults
-
-  frontend:
-    <<: *customizable_image
-    command:
-      - nginx-entrypoint.sh
+    depends_on:
+      redis-cache:
+        condition: service_started
+        required: true
+      redis-queue:
+        condition: service_started
+        required: true
     environment:
-      BACKEND: backend:8000
-      SOCKETIO: websocket:9000
-      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-$$host}
-      UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
-      UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
-      UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
-      PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
-      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
+      DB_HOST: $DB_HOST
+      DB_PORT: $DB_HOST
+      REDIS_CACHE: $REDIS_CACHE:6379
+      REDIS_QUEUE: $REDIS_QUEUE:6379
+      SOCKETIO_PORT: "9000"
     volumes:
       - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - erpnext-network
+
+  db:
+    image: mariadb:10.6
+    healthcheck:
+      test: mysqladmin ping -h $DB_HOST --password=$DB_PASSWORD
+      interval: 1s
+      retries: 15
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed # Temporary fix for MariaDB 10.6
+    hostname: erpnext-db
+    environment:
+      MARIADB_HOST: $DB_HOST
+      MARIADB_ROOT_PASSWORD: $DB_PASSWORD
+    volumes:
+      - db-data:/var/lib/mysql
+    networks:
+      - erpnext-network
+
+  frontend:
+    image: ${IMAGE_NAME}:${IMAGE_TAG}
+    hostname: ${TRAEFIK_DOMAIN}
+    deploy:
+      restart_policy:
+        condition: on-failure
     depends_on:
-      - backend
-      - websocket
+      backend:
+        condition: service_started
+        required: true
+      websocket:
+        condition: service_started
+        required: true
+    command:
+      - nginx-entrypoint.sh
+    expose:
+      - ${NGINX_PORT}
+    environment:
+      BACKEND: backend:8000
+      FRAPPE_SITE_NAME_HEADER: $SITE_NAME
+      SOCKETIO: websocket:9000
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: 600
+      CLIENT_MAX_BODY_SIZE: 50m
+      NGINX_SERVER_NAME: $TRAEFIK_DOMAIN
+      NGINX_PORT: $NGINX_PORT
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.${TRAEFIK_SERVICE_NAME}.entrypoints=${TRAEFIK_HTTPS_ENTRYPOINT}"
+      - "traefik.http.routers.${TRAEFIK_SERVICE_NAME}.rule=Host(`${TRAEFIK_DOMAIN}`)"
+      - "traefik.http.routers.${TRAEFIK_SERVICE_NAME}.tls=true"
+      - "traefik.http.routers.${TRAEFIK_SERVICE_NAME}.tls.certresolver=${TRAEFIK_CERT_RESOLVER}"
+      - "traefik.http.routers.${TRAEFIK_SERVICE_NAME}.service=${TRAEFIK_SERVICE_NAME}"
+      - "traefik.http.services.${TRAEFIK_SERVICE_NAME}.loadbalancer.server.port=${NGINX_PORT}"
+      - "traefik.docker.network=${TRAEFIK_DOCKER_NETWORK}"
+    networks:
+      - traefik-network
+      - erpnext-network
+
+  queue-long:
+    image: ${IMAGE_NAME}:${IMAGE_TAG}
+    deploy:
+      restart_policy:
+        condition: on-failure
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+        required: true
+    command:
+      - bench
+      - worker
+      - --queue
+      - long
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - erpnext-network
+
+  queue-short:
+    image: ${IMAGE_NAME}:${IMAGE_TAG}
+    deploy:
+      restart_policy:
+        condition: on-failure
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+        required: true
+    command:
+      - bench
+      - worker
+      - --queue
+      - short
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - erpnext-network
+
+  queue-default:
+    image: ${IMAGE_NAME}:${IMAGE_TAG}
+    deploy:
+      restart_policy:
+        condition: on-failure
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+        required: true
+    command:
+      - bench
+      - worker
+      - --queue
+      - default
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - erpnext-network
+
+  redis-queue:
+    image: redis:6.2-alpine
+    deploy:
+      restart_policy:
+        condition: on-failure
+    volumes:
+      - redis-queue-data:/data
+    networks:
+      - erpnext-network
+
+  redis-cache:
+    image: redis:6.2-alpine
+    deploy:
+      restart_policy:
+        condition: on-failure
+    volumes:
+      - redis-cache-data:/data
+    networks:
+      - erpnext-network
+
+  scheduler:
+    image: ${IMAGE_NAME}:${IMAGE_TAG}
+    deploy:
+      restart_policy:
+        condition: on-failure
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+        required: true
+    command:
+      - bench
+      - schedule
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - erpnext-network
 
   websocket:
-    <<: [*depends_on_configurator, *customizable_image]
+    image: ${IMAGE_NAME}:${IMAGE_TAG}
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+        required: true
+    deploy:
+      restart_policy:
+        condition: on-failure
     command:
       - node
       - /home/frappe/frappe-bench/apps/frappe/socketio.js
     volumes:
       - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
 
-  queue-short:
-    <<: *backend_defaults
-    command: bench worker --queue short,default
+    networks:
+      - erpnext-network
 
-  queue-long:
-    <<: *backend_defaults
-    command: bench worker --queue long,default,short
-
-  scheduler:
-    <<: *backend_defaults
-    command: bench schedule
-
-# ERPNext requires local assets access (Frappe does not)
 volumes:
+  db-data:
+  redis-queue-data:
+  redis-cache-data:
   sites:
+  logs:
+
+networks:
+  traefik-network:
+    name: ${TRAEFIK_DOCKER_NETWORK}
+    external: true
+  erpnext-network:
+    name: ${ERPNEXT_NETWORK}
+    driver: bridge
