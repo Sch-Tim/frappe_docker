@@ -63,7 +63,8 @@ envsubst '${BACKEND}
   ${PROXY_READ_TIMEOUT}
   ${TRAEFIK_DOMAIN}
   ${NGINX_PORT}
-  ${CLIENT_MAX_BODY_SIZE}' \
+  ${CLIENT_MAX_BODY_SIZE}
+  ${NGINX_SERVER_NAME}' \
   </templates/nginx/frappe.conf.template >/etc/nginx/conf.d/frappe.conf
 
 nginx -g 'daemon off;'
